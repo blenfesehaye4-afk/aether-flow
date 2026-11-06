@@ -5,13 +5,21 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-> **Lightweight, event-driven DAG workflow orchestration engine & async task runner in Python.**
+> **Lightweight, event-driven DAG workflow orchestration engine, durable SQLite checkpoints & async task runner in Python.**
 
-AetherFlow is an embeddable pipeline orchestrator for Directed Acyclic Graphs (DAGs). It combines cycle detection, Kahn's topological sort, non-blocking asynchronous execution pools, parameter forwarding, event-sourced audit states, and exponential retry policies.
+AetherFlow is an embeddable pipeline orchestrator for Directed Acyclic Graphs (DAGs). It combines cycle detection, Kahn's topological sort, non-blocking asynchronous execution pools, parameter forwarding, ACID SQLite state persistence, workflow checkpoint resumption, and recurring cron-style interval scheduling.
 
 ---
 
-## 🌟 Key Architecture & Features
+## 🌟 What's New in v0.2.0
+
+- 💾 **Durable SQLite State Store** ([`aether_flow/persistence.py`](file:///home/moaa/Desktop/my%20programs/bibi%20github/aether-flow/aether_flow/persistence.py)): Persistent storage for workflow runs, task checkpoints, outputs, and event streams. Survives process crashes.
+- ⏯️ **Workflow Checkpoint Resumption**: Resume interrupted or failed pipelines (`engine.resume(dag, run_id)`). Completed tasks are loaded from disk and skipped; only failed or pending tasks re-run.
+- ⏱️ **Interval Scheduler** ([`aether_flow/scheduler.py`](file:///home/moaa/Desktop/my%20programs/bibi%20github/aether-flow/aether_flow/scheduler.py)): Background interval scheduler for automated recurring pipeline executions.
+
+---
+
+## 🏗️ Architecture
 
 ```
           ┌─────────────┐
@@ -28,92 +36,40 @@ AetherFlow is an embeddable pipeline orchestrator for Directed Acyclic Graphs (D
           ┌─────────────┐
           │  Join & Load│             (Fan-in: awaits all upstreams)
           └─────────────┘
-```
-
-- 🔄 **Intuitive Bitshift DSL**: Compose complex DAG dependencies naturally with `task_a >> [task_b, task_c] >> task_d`.
-- 🛡️ **Graph Verification & Cycle Detection**: Pre-flight validation detects missing dependencies and loops using 3-color DFS.
-- ⚡ **Asyncio & Thread Pooling**: First-class support for both async `async def` coroutines and CPU-bound synchronous functions.
-- 🔁 **Resilient Retries & Timeouts**: Configurable retry policies with exponential backoff and execution timeout guards.
-- 📦 **Automated Context & Data Pipelining**: Upstream task return values are automatically forwarded to matching downstream function parameters.
-- 📊 **Event-Sourced Audit Logs**: Granular lifecycle events (`TASK_SCHEDULED`, `TASK_STARTED`, `TASK_COMPLETED`, `TASK_FAILED`, `TASK_RETRYING`).
-- 🖥️ **Rich CLI**: Visualize workflow dependency trees and inspect execution logs directly in your terminal.
-
----
-
-## 📦 Installation
-
-```bash
-pip install aether-flow
-```
-
-Or install in development mode from source:
-
-```bash
-git clone https://github.com/blenfesehaye4-afk/aether-flow.git
-cd aether-flow
-pip install -e .[dev]
+                 │
+                 ▼
+ ┌───────────────────────────────┐
+ │ SQLite Checkpoint Database    │ ➔ Stores run context, status, and task outputs
+ └───────────────────────────────┘
 ```
 
 ---
 
-## 💻 Python Quickstart
-
-Create a workflow file (e.g., `pipeline.py`):
+## 💻 Python Quickstart (Checkpoint & Resumption)
 
 ```python
 import asyncio
-from aether_flow import DAG, Task, RetryPolicy
+from aether_flow import DAG, Task, WorkflowEngine, SQLiteStateStore
 
-# Define workflow
-workflow = DAG("analytics_pipeline", name="Daily Analytics")
+# Initialize persistent SQLite store
+store = SQLiteStateStore("pipeline_state.db")
+engine = WorkflowEngine(state_store=store)
 
-# Define tasks
-async def fetch_metrics():
-    await asyncio.sleep(0.05)
-    return {"active_users": 1420, "revenue": 52300}
+workflow = DAG("resilient_etl")
 
-def score_metrics(fetch_metrics: dict):
-    return fetch_metrics["revenue"] / fetch_metrics["active_users"]
+t1 = workflow.add_task(Task("step_1", lambda: "raw_data"))
+t2 = workflow.add_task(Task("step_2", lambda step_1: step_1.upper()))
+t1 >> t2
 
-def notify_slack(score_metrics: float):
-    print(f"Daily ARPU: ${score_metrics:.2f}")
-    return True
+async def main():
+    # 1. Execute workflow (auto-checkpoints each task)
+    run = await engine.run(workflow)
+    print(f"Run completed with status: {run.status}")
 
-t_fetch = workflow.add_task(Task("fetch_metrics", fetch_metrics))
-t_score = workflow.add_task(Task("score_metrics", score_metrics))
-t_notify = workflow.add_task(Task("notify_slack", notify_slack))
+    # 2. If a pipeline fails midway, resume from the exact checkpoint:
+    # resumed = await engine.resume(workflow, run.run_id)
 
-# Chain dependencies
-t_fetch >> t_score >> t_notify
-
-# Execute
-if __name__ == "__main__":
-    from aether_flow import WorkflowEngine
-    engine = WorkflowEngine(max_concurrency=4)
-    run = asyncio.run(engine.run(workflow))
-    print(f"Status: {run.status}")
-```
-
----
-
-## 🖥️ Command-Line Interface (CLI)
-
-### 1. Visualize DAG Graph Tree
-```bash
-aether-flow graph pipeline.py
-```
-```text
-╭──────────────── Workflow Dependency Graph ────────────────╮
-│ DAG: Daily Analytics (3 tasks)                            │
-│ └── fetch_metrics (fetch_metrics) (root)                  │
-│     └── score_metrics (score_metrics)                     │
-│         └── notify_slack (notify_slack)                   │
-╰───────────────────────────────────────────────────────────╯
-```
-
-### 2. Execute Workflow
-```bash
-aether-flow run pipeline.py --concurrency 4
+asyncio.run(main())
 ```
 
 ---

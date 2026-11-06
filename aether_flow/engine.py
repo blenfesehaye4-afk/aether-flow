@@ -1,4 +1,4 @@
-"""Workflow execution engine with concurrent async worker pool and resilient retries."""
+"""Workflow execution engine with concurrent async worker pool, resilient retries, and checkpoint resumption."""
 
 import asyncio
 import inspect
@@ -18,17 +18,22 @@ class WorkflowEngine:
         self.store = state_store or StateStore()
         self.max_concurrency = max_concurrency
 
+    def _save_checkpoint(self, run: WorkflowRun) -> None:
+        if hasattr(self.store, "save_run"):
+            try:
+                self.store.save_run(run)
+            except Exception:
+                pass
+
     async def _execute_task_attempt(self, task: Task, run: WorkflowRun, attempt: int) -> TaskResult:
         start_time = time.perf_counter()
         started_dt = datetime.now(timezone.utc)
 
-        # Inspect signature to intelligently inject context or dependencies
         sig = inspect.signature(task.fn)
         kwargs = {}
         if "context" in sig.parameters:
             kwargs["context"] = run.context
 
-        # Also supply upstream outputs if parameter names match
         for param in sig.parameters:
             if param in run.context and param != "context":
                 kwargs[param] = run.context[param]
@@ -84,34 +89,44 @@ class WorkflowEngine:
                 run.record_event("TASK_COMPLETED", {"task_id": task.id, "attempt": attempt})
                 return result
 
-            # Failure branch
             if attempt > policy.max_retries:
                 run.record_event("TASK_FAILED", {"task_id": task.id, "error": result.error, "attempt": attempt})
                 return result
 
-            # Retry with exponential backoff
             run.record_event("TASK_RETRYING", {"task_id": task.id, "attempt": attempt, "backoff": current_delay})
             await asyncio.sleep(current_delay)
             current_delay = min(policy.max_delay, current_delay * policy.backoff_factor)
             attempt += 1
 
-    async def run(self, dag: DAG, initial_context: Optional[dict] = None) -> WorkflowRun:
+    async def run(
+        self,
+        dag: DAG,
+        initial_context: Optional[dict] = None,
+        existing_run: Optional[WorkflowRun] = None,
+    ) -> WorkflowRun:
         """Execute all tasks in the DAG adhering to dependency order and concurrency limits."""
         GraphValidator.validate(dag)
-        run = self.store.create_run(dag.id, initial_context)
+        run = existing_run or self.store.create_run(dag.id, initial_context)
 
         completed: Set[str] = set()
         running: Dict[str, asyncio.Task] = {}
         failed: Set[str] = set()
         skipped: Set[str] = set()
 
+        # If resuming from checkpoint, seed completed tasks
+        for t_id, res in run.results.items():
+            if res.status == TaskStatus.COMPLETED:
+                completed.add(t_id)
+                run.context[t_id] = res.output
+            elif res.status == TaskStatus.SKIPPED:
+                skipped.add(t_id)
+
+        self._save_checkpoint(run)
         total_tasks = len(dag.tasks)
 
         while (len(completed) + len(failed) + len(skipped)) < total_tasks:
-            # 1. Discover tasks ready to run
             ready = GraphValidator.get_ready_tasks(dag, completed, set(running.keys()), failed, skipped)
 
-            # 2. Check if remaining tasks must be skipped due to upstream failure
             if not ready and not running:
                 for t_id, task in dag.tasks.items():
                     if t_id not in completed and t_id not in failed and t_id not in skipped:
@@ -120,10 +135,11 @@ class WorkflowEngine:
                             res = TaskResult(task_id=t_id, status=TaskStatus.SKIPPED, error="Upstream dependency failed")
                             run.results[t_id] = res
                             run.record_event("TASK_SKIPPED", {"task_id": t_id})
+                            self._save_checkpoint(run)
+
                 if (len(completed) + len(failed) + len(skipped)) == total_tasks:
                     break
 
-            # 3. Launch ready tasks up to concurrency capacity
             available_slots = max(0, self.max_concurrency - len(running))
             for task_id in ready[:available_slots]:
                 task_obj = dag.tasks[task_id]
@@ -136,11 +152,9 @@ class WorkflowEngine:
                 await asyncio.sleep(0.01)
                 continue
 
-            # 4. Wait for at least one running task to complete
             done, _ = await asyncio.wait(running.values(), return_when=asyncio.FIRST_COMPLETED)
 
             for async_task in done:
-                # Find task_id
                 finished_id = None
                 for t_id, t_coro in running.items():
                     if t_coro == async_task:
@@ -158,8 +172,30 @@ class WorkflowEngine:
                     else:
                         failed.add(finished_id)
 
+                    self._save_checkpoint(run)
+
         run.completed_at = datetime.now(timezone.utc)
         run.status = "failed" if failed else "success"
         run.record_event("WORKFLOW_COMPLETED", {"status": run.status, "completed": len(completed), "failed": len(failed)})
+        self._save_checkpoint(run)
 
         return run
+
+    async def resume(self, dag: DAG, run_id: str) -> WorkflowRun:
+        """Resume an existing workflow run from its last checkpoint, skipping completed tasks."""
+        if hasattr(self.store, "load_run"):
+            run = self.store.load_run(run_id)
+        else:
+            run = self.store.get_run(run_id)
+
+        if not run:
+            raise ValueError(f"Run ID '{run_id}' not found in state store.")
+
+        # Clear failed tasks so they are re-executed
+        for t_id in list(run.results.keys()):
+            if run.results[t_id].status in (TaskStatus.FAILED, TaskStatus.SKIPPED):
+                del run.results[t_id]
+
+        run.status = "running"
+        run.record_event("WORKFLOW_RESUMED", {"run_id": run_id})
+        return await self.run(dag, existing_run=run)
