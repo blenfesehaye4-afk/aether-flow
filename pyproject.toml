@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aether-flow"
-version = "0.2.0"
-description = "⚙️ AetherFlow: Lightweight, event-driven DAG workflow orchestration engine & async task runner."
+version = "0.3.0"
+description = "⚙️ AetherFlow: Distributed DAG workflow orchestration engine, cron scheduler, task retries & web visualizer."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -17,10 +17,11 @@ keywords = [
     "dag",
     "task-orchestration",
     "asyncio",
-    "event-sourcing",
+    "cron-scheduler",
     "pipeline",
     "distributed-systems",
-    "cli"
+    "dashboard",
+    "fastapi"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -35,6 +36,9 @@ classifiers = [
 ]
 dependencies = [
     "rich>=13.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.22.0",
+    "pydantic>=2.0.0",
 ]
 
 [project.optional-dependencies]

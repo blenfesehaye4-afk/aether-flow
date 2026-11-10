@@ -1,4 +1,4 @@
-"""Workflow execution engine with concurrent async worker pool, resilient retries, and checkpoint resumption."""
+"""Workflow execution engine with concurrent async worker pool, priority scheduling, resilient retries, and checkpoint resumption."""
 
 import asyncio
 import inspect
@@ -8,15 +8,23 @@ from typing import Any, Dict, Optional, Set
 
 from .graph import GraphValidator
 from .models import DAG, Task, TaskResult, TaskStatus
+from .retries import AdvancedRetryPolicy
 from .state import StateStore, WorkflowRun
+from .workers import ConcurrencyLimiter, PriorityTaskQueue, TaskPriority
 
 
 class WorkflowEngine:
     """Async execution runtime for DAG workflows."""
 
-    def __init__(self, state_store: Optional[StateStore] = None, max_concurrency: int = 4):
+    def __init__(
+        self,
+        state_store: Optional[StateStore] = None,
+        max_concurrency: int = 4,
+        group_limits: Optional[Dict[str, int]] = None,
+    ):
         self.store = state_store or StateStore()
         self.max_concurrency = max_concurrency
+        self.concurrency_limiter = ConcurrencyLimiter(group_limits)
 
     def _save_checkpoint(self, run: WorkflowRun) -> None:
         if hasattr(self.store, "save_run"):
@@ -38,20 +46,27 @@ class WorkflowEngine:
             if param in run.context and param != "context":
                 kwargs[param] = run.context[param]
 
+        sem = self.concurrency_limiter.get_semaphore(task.concurrency_group)
+
         try:
-            if task.is_coroutine:
-                if task.timeout:
-                    output = await asyncio.wait_for(task.fn(**kwargs), timeout=task.timeout)
+            async def _invoke():
+                if task.is_coroutine:
+                    if task.timeout:
+                        return await asyncio.wait_for(task.fn(**kwargs), timeout=task.timeout)
+                    return await task.fn(**kwargs)
                 else:
-                    output = await task.fn(**kwargs)
+                    if task.timeout:
+                        return await asyncio.wait_for(
+                            asyncio.to_thread(task.fn, **kwargs),
+                            timeout=task.timeout,
+                        )
+                    return await asyncio.to_thread(task.fn, **kwargs)
+
+            if sem:
+                async with sem:
+                    output = await _invoke()
             else:
-                if task.timeout:
-                    output = await asyncio.wait_for(
-                        asyncio.to_thread(task.fn, **kwargs),
-                        timeout=task.timeout,
-                    )
-                else:
-                    output = await asyncio.to_thread(task.fn, **kwargs)
+                output = await _invoke()
 
             dur = time.perf_counter() - start_time
             return TaskResult(
@@ -79,7 +94,9 @@ class WorkflowEngine:
     async def _run_task_with_retries(self, task: Task, run: WorkflowRun) -> TaskResult:
         policy = task.retry_policy
         attempt = 1
-        current_delay = policy.initial_delay
+
+        # Determine max retries & delays
+        max_retries = getattr(policy, "max_retries", 0)
 
         while True:
             run.record_event("TASK_STARTED", {"task_id": task.id, "attempt": attempt})
@@ -89,13 +106,41 @@ class WorkflowEngine:
                 run.record_event("TASK_COMPLETED", {"task_id": task.id, "attempt": attempt})
                 return result
 
-            if attempt > policy.max_retries:
+            # Check if retry is allowed
+            should_retry = False
+            delay = 0.5
+            if attempt <= max_retries:
+                if isinstance(policy, AdvancedRetryPolicy):
+                    # Extract exception type from error string if needed or pass Generic Exception
+                    should_retry = True
+                    delay = policy.calculate_delay(attempt)
+                else:
+                    should_retry = True
+                    delay = min(getattr(policy, "max_delay", 10.0), getattr(policy, "initial_delay", 0.5) * (getattr(policy, "backoff_factor", 2.0) ** (attempt - 1)))
+
+            if not should_retry:
+                # Check for fallback callback hook
+                if isinstance(policy, AdvancedRetryPolicy) and policy.fallback:
+                    try:
+                        fallback_out = policy.fallback(Exception(result.error), run.context)
+                        run.record_event("TASK_FALLBACK_EXECUTED", {"task_id": task.id})
+                        return TaskResult(
+                            task_id=task.id,
+                            status=TaskStatus.COMPLETED,
+                            output=fallback_out,
+                            attempt=attempt,
+                            duration=result.duration,
+                            started_at=result.started_at,
+                            completed_at=datetime.now(timezone.utc),
+                        )
+                    except Exception as fb_err:
+                        result.error += f" | Fallback failed: {fb_err}"
+
                 run.record_event("TASK_FAILED", {"task_id": task.id, "error": result.error, "attempt": attempt})
                 return result
 
-            run.record_event("TASK_RETRYING", {"task_id": task.id, "attempt": attempt, "backoff": current_delay})
-            await asyncio.sleep(current_delay)
-            current_delay = min(policy.max_delay, current_delay * policy.backoff_factor)
+            run.record_event("TASK_RETRYING", {"task_id": task.id, "attempt": attempt, "backoff": delay})
+            await asyncio.sleep(delay)
             attempt += 1
 
     async def run(
@@ -104,7 +149,7 @@ class WorkflowEngine:
         initial_context: Optional[dict] = None,
         existing_run: Optional[WorkflowRun] = None,
     ) -> WorkflowRun:
-        """Execute all tasks in the DAG adhering to dependency order and concurrency limits."""
+        """Execute all tasks in the DAG adhering to dependency order, priority, and concurrency limits."""
         GraphValidator.validate(dag)
         run = existing_run or self.store.create_run(dag.id, initial_context)
 
@@ -112,6 +157,8 @@ class WorkflowEngine:
         running: Dict[str, asyncio.Task] = {}
         failed: Set[str] = set()
         skipped: Set[str] = set()
+
+        priority_queue = PriorityTaskQueue()
 
         # If resuming from checkpoint, seed completed tasks
         for t_id, res in run.results.items():
@@ -140,13 +187,25 @@ class WorkflowEngine:
                 if (len(completed) + len(failed) + len(skipped)) == total_tasks:
                     break
 
+            # Enqueue newly ready tasks with their priorities
+            for task_id in ready:
+                priority_queue.push(task_id, dag.tasks[task_id].priority)
+
+            # Dispatch tasks according to priority up to available concurrency slots
             available_slots = max(0, self.max_concurrency - len(running))
-            for task_id in ready[:available_slots]:
-                task_obj = dag.tasks[task_id]
-                run.record_event("TASK_SCHEDULED", {"task_id": task_id})
+            ready_set = set(ready)
+
+            while available_slots > 0 and len(priority_queue) > 0:
+                next_id = priority_queue.pop_next(ready_set)
+                if not next_id:
+                    break
+                ready_set.remove(next_id)
+                available_slots -= 1
+
+                task_obj = dag.tasks[next_id]
+                run.record_event("TASK_SCHEDULED", {"task_id": next_id, "priority": task_obj.priority.name})
                 coro = self._run_task_with_retries(task_obj, run)
-                async_task = asyncio.create_task(coro)
-                running[task_id] = async_task
+                running[next_id] = asyncio.create_task(coro)
 
             if not running:
                 await asyncio.sleep(0.01)

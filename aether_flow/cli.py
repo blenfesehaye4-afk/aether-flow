@@ -1,4 +1,4 @@
-"""Rich CLI interface for visualizing, executing, and auditing AetherFlow workflows."""
+"""Rich CLI interface for visualizing, executing, auditing, and serving AetherFlow workflows."""
 
 import argparse
 import asyncio
@@ -9,9 +9,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
 
+from .dashboard import app as dashboard_app, register_dag, set_dashboard_engine
 from .engine import WorkflowEngine
 from .graph import GraphValidator
-from .models import DAG, TaskStatus
+from .models import DAG, Task, TaskStatus
+from .retries import AdvancedRetryPolicy, BackoffStrategy
+from .workers import TaskPriority
 
 console = Console()
 
@@ -45,14 +48,15 @@ def print_dag_graph(dag: DAG) -> None:
     roots = [t for t in dag.tasks.values() if not t.dependencies]
 
     def add_children(parent_node, parent_task_id: str):
-        # Find tasks that depend on parent_task_id
         children = [t for t in dag.tasks.values() if parent_task_id in t.dependencies]
         for child in children:
-            child_node = parent_node.add(f"[green]{child.name}[/green] [dim]({child.id})[/dim]")
+            prio_badge = f"[magenta][{child.priority.name}][/magenta]" if child.priority != TaskPriority.NORMAL else ""
+            child_node = parent_node.add(f"[green]{child.name}[/green] {prio_badge} [dim]({child.id})[/dim]")
             add_children(child_node, child.id)
 
     for root in roots:
-        root_node = tree.add(f"[bold yellow]{root.name}[/bold yellow] [dim]({root.id})[/dim] (root)")
+        prio_badge = f"[magenta][{root.priority.name}][/magenta]" if root.priority != TaskPriority.NORMAL else ""
+        root_node = tree.add(f"[bold yellow]{root.name}[/bold yellow] {prio_badge} [dim]({root.id})[/dim] (root)")
         add_children(root_node, root.id)
 
     console.print(Panel(tree, title="Workflow Dependency Graph", expand=False))
@@ -84,6 +88,84 @@ async def execute_dag(dag: DAG, concurrency: int = 4) -> None:
     console.print(table)
 
 
+def run_demo():
+    """Run an interactive demonstration of AetherFlow v0.3.0 features."""
+    console.print(Panel(
+        "[bold cyan]AetherFlow v0.3.0 Architecture Showcase[/bold cyan]\n"
+        "Demonstrating Priority Queues, Jitter Retries, Fallbacks, and Distributed Graph Execution.",
+        expand=False,
+    ))
+
+    dag = DAG("enterprise_ai_pipeline", name="Enterprise AI Ingestion & Analysis")
+
+    # 1. Fetch Raw Data (Root)
+    async def fetch_data():
+        await asyncio.sleep(0.05)
+        return {"records": [101, 102, 103], "batch_id": "b-99"}
+
+    t_fetch = dag.add_task(Task("fetch_data", fetch_data, name="Fetch Batch Data", priority=TaskPriority.HIGH))
+
+    # 2. Flaky Embedding task with Exponential Backoff + Full Jitter & Fallback
+    attempt_counter = {"count": 0}
+
+    async def compute_embeddings(fetch_data):
+        attempt_counter["count"] += 1
+        if attempt_counter["count"] < 3:
+            raise ConnectionError("Upstream vector service unavailable (simulated timeout)")
+        return f"Embeddings computed for {len(fetch_data['records'])} records"
+
+    policy = AdvancedRetryPolicy(
+        max_retries=3,
+        initial_delay=0.05,
+        backoff_factor=1.5,
+        strategy=BackoffStrategy.FULL_JITTER,
+        fallback=lambda exc, ctx: "Cached Embeddings (Fallback)",
+    )
+
+    t_embed = dag.add_task(Task("embeddings", compute_embeddings, name="Compute Embeddings (with Jitter Retries)", retries=policy))
+
+    # 3. High-Priority Anomaly Detection Task
+    async def detect_anomalies(fetch_data):
+        await asyncio.sleep(0.02)
+        return {"anomalies_detected": 0, "status": "clean"}
+
+    t_anomaly = dag.add_task(Task("anomaly_check", detect_anomalies, name="Real-Time Anomaly Check", priority=TaskPriority.CRITICAL))
+
+    # 4. Fan-In Summarization
+    async def generate_report(embeddings, anomaly_check):
+        return f"Summary: {embeddings} | Anomalies: {anomaly_check['status']}"
+
+    t_report = dag.add_task(Task("generate_report", generate_report, name="Consolidate Report"))
+
+    # Graph wiring: fetch_data >> [embeddings, anomaly_check] >> generate_report
+    t_fetch >> [t_embed, t_anomaly]
+    t_embed >> t_report
+    t_anomaly >> t_report
+
+    print_dag_graph(dag)
+    asyncio.run(execute_dag(dag, concurrency=4))
+
+
+def run_ui(host: str = "127.0.0.1", port: int = 8500):
+    """Launch the Web DAG Dashboard."""
+    import uvicorn
+    console.print(Panel(
+        f"[bold green]Starting AetherFlow Web Visualizer[/bold green]\n"
+        f"URL: [cyan]http://{host}:{port}[/cyan]",
+        expand=False,
+    ))
+
+    # Register sample workflow for visualization
+    sample_dag = DAG("sample_pipeline", name="Data Ingestion & Training Pipeline", cron="*/15 * * * *")
+    t1 = sample_dag.add_task(Task("extract_db", lambda: "raw_data", name="Extract from SQL", priority=TaskPriority.HIGH))
+    t2 = sample_dag.add_task(Task("transform_data", lambda extract_db: extract_db.upper(), name="Feature Engineering"))
+    t3 = sample_dag.add_task(Task("model_train", lambda transform_data: f"Model on {transform_data}", name="Train XGBoost", priority=TaskPriority.CRITICAL))
+    t1 >> t2 >> t3
+    register_dag(sample_dag)
+
+    uvicorn.run(dashboard_app, host=host, port=port)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="aether-flow",
@@ -100,6 +182,14 @@ def main():
     graph_cmd = subparsers.add_parser("graph", help="Display visual dependency graph of a workflow")
     graph_cmd.add_argument("file", help="Path to Python workflow file")
 
+    # Demo
+    subparsers.add_parser("demo", help="Run showcase of v0.3.0 features (Priorities, Jitter, Fallbacks)")
+
+    # UI
+    ui_cmd = subparsers.add_parser("ui", help="Start the interactive web DAG visualizer and dashboard")
+    ui_cmd.add_argument("--host", default="127.0.0.1", help="Host address")
+    ui_cmd.add_argument("--port", type=int, default=8500, help="Port number")
+
     args = parser.parse_args()
 
     if args.command == "run":
@@ -108,6 +198,10 @@ def main():
     elif args.command == "graph":
         dag = load_dag_from_file(Path(args.file))
         print_dag_graph(dag)
+    elif args.command == "demo":
+        run_demo()
+    elif args.command == "ui":
+        run_ui(host=args.host, port=args.port)
     else:
         parser.print_help()
 

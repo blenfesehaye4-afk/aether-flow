@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
+from .retries import AdvancedRetryPolicy, BackoffStrategy
+from .workers import TaskPriority
+
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
@@ -20,6 +23,7 @@ class TaskStatus(str, Enum):
 
 @dataclass
 class RetryPolicy:
+    """Legacy backward-compatible retry policy definition."""
     max_retries: int = 3
     initial_delay: float = 0.5
     backoff_factor: float = 2.0
@@ -46,22 +50,26 @@ class Task:
         id: str,
         fn: Callable[..., Any],
         name: Optional[str] = None,
-        retries: Optional[Union[int, RetryPolicy]] = None,
+        retries: Optional[Union[int, RetryPolicy, AdvancedRetryPolicy]] = None,
         timeout: Optional[float] = None,
         dependencies: Optional[Set[str]] = None,
+        priority: TaskPriority = TaskPriority.NORMAL,
+        concurrency_group: Optional[str] = None,
     ):
         self.id = id
         self.fn = fn
         self.name = name or id
         self.timeout = timeout
         self.dependencies: Set[str] = set(dependencies) if dependencies else set()
+        self.priority = priority
+        self.concurrency_group = concurrency_group
 
         if isinstance(retries, int):
-            self.retry_policy = RetryPolicy(max_retries=retries)
-        elif isinstance(retries, RetryPolicy):
+            self.retry_policy: Union[RetryPolicy, AdvancedRetryPolicy] = AdvancedRetryPolicy(max_retries=retries)
+        elif isinstance(retries, (RetryPolicy, AdvancedRetryPolicy)):
             self.retry_policy = retries
         else:
-            self.retry_policy = RetryPolicy(max_retries=0)
+            self.retry_policy = AdvancedRetryPolicy(max_retries=0)
 
     @property
     def is_coroutine(self) -> bool:
@@ -83,16 +91,23 @@ class Task:
         return other
 
     def __repr__(self) -> str:
-        return f"<Task id='{self.id}' deps={list(self.dependencies)}>"
+        return f"<Task id='{self.id}' priority={self.priority.name} deps={list(self.dependencies)}>"
 
 
 class DAG:
     """Directed Acyclic Graph container organizing tasks and dependencies."""
 
-    def __init__(self, id: str, name: Optional[str] = None, description: Optional[str] = None):
+    def __init__(
+        self,
+        id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        cron: Optional[str] = None,
+    ):
         self.id = id
         self.name = name or id
         self.description = description or ""
+        self.cron = cron
         self.tasks: Dict[str, Task] = {}
 
     def add_task(self, task: Task) -> Task:
@@ -104,13 +119,23 @@ class DAG:
         self,
         id: Optional[str] = None,
         name: Optional[str] = None,
-        retries: Optional[Union[int, RetryPolicy]] = None,
+        retries: Optional[Union[int, RetryPolicy, AdvancedRetryPolicy]] = None,
         timeout: Optional[float] = None,
+        priority: TaskPriority = TaskPriority.NORMAL,
+        concurrency_group: Optional[str] = None,
     ) -> Callable[[Callable[..., Any]], Task]:
         """Decorator for registering tasks."""
         def decorator(fn: Callable[..., Any]) -> Task:
             task_id = id or fn.__name__
-            t = Task(id=task_id, fn=fn, name=name, retries=retries, timeout=timeout)
+            t = Task(
+                id=task_id,
+                fn=fn,
+                name=name,
+                retries=retries,
+                timeout=timeout,
+                priority=priority,
+                concurrency_group=concurrency_group,
+            )
             self.add_task(t)
             return t
         return decorator
